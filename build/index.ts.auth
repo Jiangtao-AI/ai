@@ -1,0 +1,112 @@
+// src/index.ts
+import {
+  basekit,
+  FieldType,
+  FieldComponent,
+  FieldCode,
+  AuthorizationType,
+} from '@lark-opdev/block-basekit-server-api';
+
+/* ---------- 域名白名单（含 Bucket 域名） ---------- */
+basekit.addDomainList([
+  'dashscope.aliyuncs.com',
+  'dashscope-result-bj.oss-cn-beijing.aliyuncs.com',
+  'oss-cn-beijing.aliyuncs.com',
+  'jtcoze.oss-cn-beijing.aliyuncs.com', // 你的 Bucket
+  'feishu.cn',
+  'internal-api-drive-stream.feishu.cn',
+]);
+
+basekit.addField({
+  // 授权配置 - 使用 HeaderBearerToken 方式
+  authorizations: [
+    {
+      id: 'dashscope_auth',
+      platform: 'dashscope',
+      type: AuthorizationType.HeaderBearerToken,
+      label: '阿里百炼 API-KEY',
+      required: true,
+      instructionsUrl: 'https://help.aliyun.com/document_detail/611472.html',
+      icon: {
+        light: 'https://img.alicdn.com/imgextra/i2/O1CN01sdqPwt1t0hBlKFj9c_!!6000000005848-2-tps-200-200.png',
+        dark: 'https://img.alicdn.com/imgextra/i2/O1CN01sdqPwt1t0hBlKFj9c_!!6000000005848-2-tps-200-200.png',
+      },
+    },
+  ],
+
+  // 1. 单入口：附件 / 链接 / 文本 三格式
+  formItems: [
+    {
+      key: 'audioVideo',
+      label: '音视频来源',
+      component: FieldComponent.FieldSelect,
+      props: { supportType: [FieldType.Attachment, FieldType.Url, FieldType.Text], mode: 'single' },
+      validator: { required: true },
+    },
+  ],
+  resultType: { type: FieldType.Text },
+
+  execute: async (formItemParams, context) => {
+    try {
+      const item = formItemParams.audioVideo?.[0];
+      if (!item) throw new Error('未选择音视频');
+
+      let videoUrl: string;
+      if (item.tmp_url) { videoUrl = item.tmp_url; }
+      else if (item.link) { videoUrl = item.link; }
+      else if (item.text) { videoUrl = item.text; }
+      else { throw new Error('无法识别的音视频格式'); }
+      console.log('① 视频来源', videoUrl);
+
+      const body = {
+        model: 'qwen3-asr-flash-filetrans',
+        input: { file_url: videoUrl },
+        parameters: { enable_itn: true },
+      };
+      const submitRes = await context.fetch(
+        'https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-DashScope-Async': 'enable',
+          },
+          body: JSON.stringify(body),
+        },
+        'dashscope_auth' // 使用授权ID，框架会自动添加 Authorization: Bearer API-KEY
+      );
+      if (!submitRes.ok) throw new Error(`提交任务 ${submitRes.status}`);
+      const { output } = await submitRes.json();
+      const taskId = output.task_id;
+      console.log('② task_id', taskId);
+
+      for (let i = 0; i < 180; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        const pollRes = await context.fetch(
+          `https://dashscope.aliyuncs.com/api/v1/tasks/${taskId}`,
+          {
+            method: 'GET',
+          },
+          'dashscope_auth' // 使用相同的授权ID
+        );
+        const json = await pollRes.json();
+        const status = json.output?.task_status;
+        console.log('③ 轮询', i, status);
+        if (status === 'SUCCEEDED') {
+          const resultUrl = json.output.result.transcription_url;
+          const resultRes = await context.fetch(resultUrl);
+          const resultJson = await resultRes.json();
+          const fullText = resultJson.transcripts?.map((t: any) => t.text).join('\n') || '';
+          return { code: FieldCode.Success, data: fullText };
+        }
+        if (status === 'FAILED') throw new Error('百炼识别失败');
+      }
+      throw new Error('识别超时（15min）');
+    } catch (e: any) {
+      console.error('===真实错误===', e.message);
+      return { code: FieldCode.Error, msg: e.message };
+    }
+  },
+});
+
+export default basekit;
